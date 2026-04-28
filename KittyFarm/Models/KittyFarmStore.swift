@@ -867,12 +867,16 @@ final class KittyFarmStore {
     // MARK: - Build & Play
 
     func buildAndPlay() async {
+        await buildAndPlay(for: activeDevices)
+    }
+
+    func buildAndPlay(for targetDevices: [DeviceState]) async {
         guard !isRunningBuildAndPlay else {
             return
         }
 
-        let iosDevices = activeDevices.map(\.descriptor).filter(\.canRunIOSApps)
-        let androidDevices = activeDevices.map(\.descriptor).filter { $0.platform == .androidEmulator }
+        let iosDevices = iosBuildDescriptors(for: targetDevices)
+        let androidDevices = targetDevices.map(\.descriptor).filter { $0.platform == .androidEmulator }
 
         guard !iosDevices.isEmpty || !androidDevices.isEmpty else {
             statusMessage = "Add at least one simulator or emulator before building."
@@ -894,7 +898,7 @@ final class KittyFarmStore {
         await runtimeLogManager.stopAll()
         isRunningBuildAndPlay = true
 
-        for device in activeDevices {
+        for device in targetDevices {
             device.isBuildingApp = true
         }
         var successes: [String] = []
@@ -903,7 +907,7 @@ final class KittyFarmStore {
 
         defer {
             isRunningBuildAndPlay = false
-            for device in activeDevices {
+            for device in targetDevices {
                 device.isBuildingApp = false
             }
 
@@ -1027,86 +1031,43 @@ final class KittyFarmStore {
     }
 
     func buildAndPlay(for device: DeviceState) async {
-        guard !isRunningBuildAndPlay else { return }
+        await buildAndPlay(for: [device])
+    }
 
-        let descriptor = device.descriptor
-        let iosDevices = descriptor.canRunIOSApps ? [descriptor] : []
-        let androidDevices = descriptor.platform == .androidEmulator ? [descriptor] : []
-
-        if descriptor.platform == .iOSSimulator, !descriptor.canRunIOSApps {
-            statusMessage = "\(descriptor.displayName) runs \(descriptor.osVersion ?? "a non-iOS runtime") and cannot launch an iOS app target."
-            return
-        }
-
-        if !iosDevices.isEmpty, selectedIOSProject == nil {
-            statusMessage = "Choose an iOS project before building."
-            return
-        }
-        if !androidDevices.isEmpty, selectedAndroidProject == nil {
-            statusMessage = "Choose an Android project before building."
-            return
-        }
-
-        let buildStartedAt = Date()
-        beginBuildLogSession()
-        isRunningBuildAndPlay = true
-        device.isBuildingApp = true
-
-        defer {
-            isRunningBuildAndPlay = false
-            device.isBuildingApp = false
-        }
-
-        let logger: BuildPlayRunner.Logger = { [weak self] source, message in
-            self?.queueBuildLog(source: source, message: message)
-        }
-
-        if let project = selectedIOSProject, !iosDevices.isEmpty {
-            statusMessage = "Building \(project.displayName) for \(descriptor.displayName)…"
-            appendBuildLog("Building \(project.displayName) for \(descriptor.displayName)", source: .system)
-            do {
-                let result = try await BuildPlayRunner.buildAndRunIOS(
-                    project: project, devices: iosDevices, logger: logger
-                )
-                let summary = "iOS launched on \(descriptor.displayName)"
-                appendBuildLog(summary, source: .system)
-                statusMessage = summary
-
-                if !result.runtimeTargets.isEmpty {
-                    await runtimeLogManager.replaceStreams(for: result.runtimeTargets) { [weak self] source, message in
-                        self?.queueBuildLog(source: source, message: message)
-                    }
-                    startCrashReportMonitoring(for: result.runtimeTargets, since: buildStartedAt)
-                }
-            } catch {
-                let msg = "iOS failed: \(error.localizedDescription)"
-                appendBuildLog(msg, source: .system, severity: .error)
-                statusMessage = msg
+    private func iosBuildDescriptors(for targetDevices: [DeviceState]) -> [DeviceDescriptor] {
+        var descriptors = targetDevices.map(\.descriptor).filter { $0.platform == .iOSSimulator }
+        var descriptorIDs = Set(descriptors.map(\.id))
+        let activeByUDID = Dictionary(
+            uniqueKeysWithValues: activeDevices.compactMap { state -> (String, DeviceDescriptor)? in
+                guard let udid = state.descriptor.iosUDID else { return nil }
+                return (udid, state.descriptor)
             }
+        )
+
+        for descriptor in Array(descriptors) {
+            guard let udid = descriptor.iosUDID else { continue }
+            let companionUDID: String?
+            if descriptor.isWatchSimulator {
+                companionUDID = simulatorPairs.first { $0.watch.udid == udid }?.phone.udid
+            } else if descriptor.isIPhoneSimulator {
+                companionUDID = simulatorPairs.first { $0.phone.udid == udid }?.watch.udid
+            } else {
+                companionUDID = nil
+            }
+            guard let companionUDID,
+                  let companion = activeByUDID[companionUDID],
+                  !descriptorIDs.contains(companion.id) else {
+                continue
+            }
+            descriptors.append(companion)
+            descriptorIDs.insert(companion.id)
         }
 
-        if let project = selectedAndroidProject, !androidDevices.isEmpty {
-            statusMessage = "Building \(project.displayName) for \(descriptor.displayName)…"
-            appendBuildLog("Building \(project.displayName) for \(descriptor.displayName)", source: .system)
-            do {
-                let result = try await BuildPlayRunner.buildAndRunAndroid(
-                    project: project, devices: androidDevices, logger: logger
-                )
-                let summary = "Android launched on \(descriptor.displayName)"
-                appendBuildLog(summary, source: .system)
-                statusMessage = summary
-
-                if !result.runtimeTargets.isEmpty {
-                    await runtimeLogManager.replaceStreams(for: result.runtimeTargets) { [weak self] source, message in
-                        self?.queueBuildLog(source: source, message: message)
-                    }
-                    startCrashReportMonitoring(for: result.runtimeTargets, since: buildStartedAt)
-                }
-            } catch {
-                let msg = "Android failed: \(error.localizedDescription)"
-                appendBuildLog(msg, source: .system, severity: .error)
-                statusMessage = msg
+        return descriptors.sorted { lhs, rhs in
+            if lhs.isWatchSimulator != rhs.isWatchSimulator {
+                return !lhs.isWatchSimulator
             }
+            return lhs.displayName.localizedStandardCompare(rhs.displayName) == .orderedAscending
         }
     }
 

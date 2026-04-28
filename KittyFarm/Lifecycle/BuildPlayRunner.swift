@@ -8,6 +8,13 @@ struct BuildPlayRunner {
         let runtimeTargets: [RuntimeLogTarget]
     }
 
+    private struct AppleSimulatorTarget: Sendable {
+        let udid: String
+        let name: String
+        let runtime: String
+        let isWatch: Bool
+    }
+
     private static var fileManager: FileManager { FileManager.default }
     private static let xcodebuildURL = URL(fileURLWithPath: "/usr/bin/xcodebuild")
     private static var xcrunURL: URL { XcrunUtils.xcrunURL }
@@ -70,14 +77,23 @@ struct BuildPlayRunner {
         devices: [DeviceDescriptor],
         logger: Logger? = nil
     ) async throws -> LaunchResult {
-        let simulators = devices.compactMap { descriptor -> (udid: String, name: String, runtime: String)? in
+        let simulators = devices.compactMap { descriptor -> AppleSimulatorTarget? in
             guard case let .iOSSimulator(udid, name, runtime) = descriptor else { return nil }
-            return (udid: udid, name: name, runtime: runtime)
+            return AppleSimulatorTarget(
+                udid: udid,
+                name: name,
+                runtime: runtime,
+                isWatch: descriptor.isWatchSimulator
+            )
         }
         guard !simulators.isEmpty else {
             return LaunchResult(launchedDeviceCount: 0, runtimeTargets: [])
         }
-        let primarySimulator = simulators[0]
+        let appSimulators = simulators.filter { !$0.isWatch }
+        let watchSimulators = simulators.filter(\.isWatch)
+        guard let primarySimulator = appSimulators.first else {
+            throw BuildPlayError.missingPairedIPhone
+        }
         let platformPrefix = "[platform iOS]"
 
         let derivedDataURL = tempBuildRoot()
@@ -114,9 +130,18 @@ struct BuildPlayRunner {
             throw BuildPlayError.missingBundleID(appURL.lastPathComponent)
         }
         let executableName = Bundle(url: appURL)?.object(forInfoDictionaryKey: "CFBundleExecutable") as? String ?? project.scheme
+        let watchAppURL = watchSimulators.isEmpty ? nil : try findBuiltWatchApp(in: derivedDataURL, hostAppURL: appURL)
+        let watchBundleID = watchAppURL.flatMap { Bundle(url: $0)?.bundleIdentifier }
+        let watchExecutableName = watchAppURL.flatMap {
+            Bundle(url: $0)?.object(forInfoDictionaryKey: "CFBundleExecutable") as? String
+        }
+
+        if !watchSimulators.isEmpty, watchBundleID?.isEmpty ?? true {
+            throw BuildPlayError.missingBundleID(watchAppURL?.lastPathComponent ?? "watch app")
+        }
 
         try await withThrowingTaskGroup(of: Void.self) { group in
-            for simulator in simulators {
+            for simulator in appSimulators {
                 group.addTask {
                     let udid = simulator.udid
                     let devicePrefix = "[device \(simulator.name) (\(String(udid.prefix(8))))]"
@@ -137,18 +162,50 @@ struct BuildPlayRunner {
                     )
                 }
             }
+            if let watchAppURL, let watchBundleID {
+                for simulator in watchSimulators {
+                    group.addTask {
+                        let udid = simulator.udid
+                        let devicePrefix = "[device \(simulator.name) (\(String(udid.prefix(8))))]"
+                        await logger?(.system, "\(devicePrefix) Ensuring watch simulator is booted")
+                        try await ensureSimulatorReady(udid: udid, logPrefix: devicePrefix, logger: logger)
+                        try await runSimctl(
+                            ["install", udid, watchAppURL.path],
+                            context: "simctl install watch app \(udid)",
+                            logPrefix: devicePrefix,
+                            logger: logger
+                        )
+                        try await runSimctl(
+                            ["launch", "--terminate-running-process", udid, watchBundleID],
+                            context: "simctl launch \(watchBundleID)",
+                            logPrefix: devicePrefix,
+                            logger: logger,
+                            environment: XcrunUtils.simulatorAppLaunchEnvironment
+                        )
+                    }
+                }
+            }
             try await group.waitForAll()
+        }
+
+        let appRuntimeTargets = appSimulators.map {
+            RuntimeLogTarget.iOSSimulator(
+                udid: $0.udid,
+                processName: executableName,
+                deviceLabel: $0.name
+            )
+        }
+        let watchRuntimeTargets = watchSimulators.map {
+            RuntimeLogTarget.iOSSimulator(
+                udid: $0.udid,
+                processName: watchExecutableName ?? project.scheme,
+                deviceLabel: $0.name
+            )
         }
 
         return LaunchResult(
             launchedDeviceCount: simulators.count,
-            runtimeTargets: simulators.map {
-                .iOSSimulator(
-                    udid: $0.udid,
-                    processName: executableName,
-                    deviceLabel: $0.name
-                )
-            }
+            runtimeTargets: appRuntimeTargets + watchRuntimeTargets
         )
     }
 
@@ -339,7 +396,10 @@ struct BuildPlayRunner {
     private static func findBuiltIOSApp(in derivedDataURL: URL, preferredName: String) throws -> URL {
         let productsURL = derivedDataURL.appending(path: "Build/Products")
         let appCandidates = try discoverFiles(under: productsURL, matchingExtensions: ["app"], maxDepth: 3)
-            .filter { !$0.lastPathComponent.localizedCaseInsensitiveContains("Tests") }
+            .filter {
+                !$0.lastPathComponent.localizedCaseInsensitiveContains("Tests")
+                    && !$0.path.localizedCaseInsensitiveContains("watchsimulator")
+            }
 
         if let preferred = appCandidates.first(where: { $0.lastPathComponent == "\(preferredName).app" }) {
             return preferred
@@ -349,6 +409,27 @@ struct BuildPlayRunner {
         }
 
         throw BuildPlayError.missingBuiltApp(productsURL.path)
+    }
+
+    private static func findBuiltWatchApp(in derivedDataURL: URL, hostAppURL: URL) throws -> URL {
+        let embeddedWatchURL = hostAppURL.appending(path: "Watch", directoryHint: .isDirectory)
+        let embeddedCandidates = try discoverFiles(under: embeddedWatchURL, matchingExtensions: ["app"], maxDepth: 1)
+            .filter { !$0.lastPathComponent.localizedCaseInsensitiveContains("Tests") }
+        if let embedded = embeddedCandidates.first {
+            return embedded
+        }
+
+        let productsURL = derivedDataURL.appending(path: "Build/Products")
+        let productCandidates = try discoverFiles(under: productsURL, matchingExtensions: ["app"], maxDepth: 3)
+            .filter {
+                !$0.lastPathComponent.localizedCaseInsensitiveContains("Tests")
+                    && $0.path.localizedCaseInsensitiveContains("watchsimulator")
+            }
+        if let product = productCandidates.first {
+            return product
+        }
+
+        throw BuildPlayError.missingBuiltWatchApp(productsURL.path)
     }
 
     private static func ensureSimulatorReady(
@@ -664,7 +745,9 @@ enum BuildPlayError: LocalizedError {
     case unsupportedIOSSelection(String)
     case noXcodeScheme(String)
     case missingBuiltApp(String)
+    case missingBuiltWatchApp(String)
     case missingBundleID(String)
+    case missingPairedIPhone
     case unsupportedAndroidSelection(String)
     case missingAndroidApplicationID(String)
     case missingJavaRuntime
@@ -679,8 +762,12 @@ enum BuildPlayError: LocalizedError {
             return "No runnable Xcode scheme was found for \(name)."
         case let .missingBuiltApp(path):
             return "Couldn't find a built iOS app under \(path)."
+        case let .missingBuiltWatchApp(path):
+            return "Couldn't find a built watchOS app under \(path). Make sure the selected iOS scheme includes a watch app target."
         case let .missingBundleID(name):
             return "Couldn't read the iOS bundle identifier from \(name)."
+        case .missingPairedIPhone:
+            return "A watchOS simulator build needs an active paired iPhone simulator to build the selected iOS scheme."
         case let .unsupportedAndroidSelection(path):
             return "No Gradle wrapper was found in \(path)."
         case let .missingAndroidApplicationID(path):

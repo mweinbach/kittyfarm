@@ -268,9 +268,7 @@ extension KittyFarmStore {
             if !missing.isEmpty {
                 throw LocalControlStoreError.invalidRequest("Build requested inactive devices: \(missing.sorted().joined(separator: ", "))")
             }
-            for device in activeDevices where selected.contains(device.id) {
-                await buildAndPlay(for: device)
-            }
+            await buildAndPlay(for: activeDevices.filter { selected.contains($0.id) })
         } else {
             await buildAndPlay()
         }
